@@ -1,0 +1,79 @@
+name: 更新赚钱资讯
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 爬取资讯
+        run: |
+          pip install requests beautifulsoup4 -q
+
+          python3 << 'PYEOF'
+          import requests, json, datetime
+          from bs4 import BeautifulSoup
+          from urllib.parse import quote
+
+          articles = []
+          today = datetime.date.today().isoformat()
+          headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
+
+          keywords = [
+            ("副业 赚钱 方法 2026", "副业"),
+            ("创业 商机 AI 2026", "创业"),
+            ("电商 带货 月入 2026", "电商"),
+            ("投资 理财 赚钱 2026", "投资"),
+          ]
+
+          for kw, cat in keywords:
+            try:
+              url = f"https://cn.bing.com/search?q={quote(kw)}&first=0"
+              r = requests.get(url, headers=headers, timeout=10)
+              soup = BeautifulSoup(r.text, 'html.parser')
+              for item in soup.select('.b_algo')[:3]:
+                t = item.select_one('h2 a')
+                if not t: continue
+                link = t.get('href', '')
+                p = item.select_one('.b_caption p')
+                desc = p.get_text(strip=True)[:200] if p else ''
+                articles.append({
+                  "title": t.get_text(strip=True),
+                  "source": "必应",
+                  "url": link,
+                  "summary": desc,
+                  "category": cat,
+                  "tags": kw.split()[:2],
+                  "date": today
+                })
+            except Exception as e:
+              print(f"Error: {e}")
+
+          if not articles:
+            articles = [{
+              "title": "系统就绪，等待首次抓取",
+              "source": "系统",
+              "url": "https://github.com/adammo01/money-news",
+              "summary": "爬虫已配置，将于下次触发时自动抓取资讯",
+              "category": "系统",
+              "tags": ["系统"],
+              "date": today
+            }]
+
+          data = {"updated": today, "articles": articles[:20]}
+          with open("articles.json", "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+          print(f"更新了 {len(articles)} 条资讯")
+          PYEOF
+
+      - name: 提交更新
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add articles.json
+          git diff --quiet && echo "无变化" || git commit -m "自动更新 $(date +%Y-%m-%d)"
+          git push
