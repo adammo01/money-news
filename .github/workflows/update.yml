@@ -13,64 +13,213 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: 安装依赖
+        run: pip install beautifulsoup4 lxml -q
+
       - name: 爬取资讯
         run: |
-          pip install requests beautifulsoup4 -q
-
           python3 << 'PYEOF'
-          import requests, json, datetime
+          import requests, json, datetime, re
           from bs4 import BeautifulSoup
+          import xml.etree.ElementTree as ET
           from urllib.parse import quote
+          from collections import Counter
 
           articles = []
           today = datetime.date.today().isoformat()
-          headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
+          headers = {
+              "User-Agent": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.144 Mobile Safari/537.36",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+          }
 
-          keywords = [
-            ("副业 赚钱 方法 2026", "副业"),
-            ("创业 商机 AI 2026", "创业"),
-            ("电商 带货 月入 2026", "电商"),
-            ("投资 理财 赚钱 2026", "投资"),
-          ]
+          def guess_cat(text):
+              t = text.lower()
+              if any(k in t for k in ['副业','兼职','接单','外包','freelance','side project','私活','赚钱','变现','月入','副业','开发者','独立']): return '副业'
+              if any(k in t for k in ['电商','带货','shop','淘宝','小红书','跨境','amazon']): return '电商'
+              if any(k in t for k in ['投资','理财','股票','基金']): return '投资'
+              if any(k in t for k in ['创业','融资','startup','商业','公司','vc']): return '创业'
+              if any(k in t for k in ['ai','人工智能','gpt','大模型','aigc','chatgpt','llm']): return 'AI'
+              return '副业'
 
-          for kw, cat in keywords:
-            try:
-              url = f"https://cn.bing.com/search?q={quote(kw)}&first=0"
-              r = requests.get(url, headers=headers, timeout=10)
+          # ── 1. 36kr RSS ────────────────────────────────
+          try:
+              r = requests.get("https://36kr.com/feed", headers=headers, timeout=10)
+              root = ET.fromstring(r.content)
+              channel = root.find('channel')
+              items = channel.findall('item') if channel else []
+              for item in items[:6]:
+                  title = item.findtext('title', '').strip()
+                  link = item.findtext('link', '').strip()
+                  desc = re.sub(r'<[^>]+>', '', item.findtext('description', ''))[:150].strip()
+                  pub = item.findtext('pubDate', '')[:10]
+                  if title and link:
+                      articles.append({
+                          "title": title, "source": "36kr",
+                          "url": link, "summary": desc,
+                          "category": guess_cat(title + desc),
+                          "tags": ["创业", "科技"],
+                          "date": pub if pub else today
+                      })
+              print(f"✅ 36kr RSS: 6 条")
+          except Exception as e:
+              print(f"❌ 36kr: {e}")
+
+          # ── 2. 钛媒体 (HTML解析) ───────────────────────
+          try:
+              r = requests.get("https://www.tmtpost.com/", headers=headers, timeout=10)
               soup = BeautifulSoup(r.text, 'html.parser')
-              for item in soup.select('.b_algo')[:3]:
-                t = item.select_one('h2 a')
-                if not t: continue
-                link = t.get('href', '')
-                p = item.select_one('.b_caption p')
-                desc = p.get_text(strip=True)[:200] if p else ''
-                articles.append({
-                  "title": t.get_text(strip=True),
-                  "source": "必应",
-                  "url": link,
-                  "summary": desc,
-                  "category": cat,
-                  "tags": kw.split()[:2],
-                  "date": today
-                })
-            except Exception as e:
-              print(f"Error: {e}")
+              # 尝试多个可能的选择器
+              items = soup.select('.tmt-news-item, .article-item, .js-article-item, [data-id]')[:6]
+              n = 0
+              for it in items:
+                  t_el = it.select_one('h2 a, h3 a, .title a, .article-title a')
+                  if not t_el: continue
+                  title = t_el.get_text(strip=True)
+                  link = t_el.get('href', '')
+                  if link and not link.startswith('http'):
+                      link = 'https://www.tmtpost.com' + link
+                  if title and link:
+                      articles.append({
+                          "title": title, "source": "钛媒体",
+                          "url": link,
+                          "summary": (it.get_text(strip=True)[:150]),
+                          "category": guess_cat(title),
+                          "tags": ["科技", "创投"],
+                          "date": today
+                      })
+                      n += 1
+              print(f"✅ 钛媒体: {n} 条")
+          except Exception as e:
+              print(f"❌ 钛媒体: {e}")
 
-          if not articles:
-            articles = [{
-              "title": "系统就绪，等待首次抓取",
-              "source": "系统",
-              "url": "https://github.com/adammo01/money-news",
-              "summary": "爬虫已配置，将于下次触发时自动抓取资讯",
-              "category": "系统",
-              "tags": ["系统"],
-              "date": today
-            }]
+          # ── 3. V2EX 最新帖子 ──────────────────────────
+          try:
+              r = requests.get("https://www.v2ex.com/?tab=all", headers=headers, timeout=10)
+              soup = BeautifulSoup(r.text, 'html.parser')
+              n = 0
+              for row in soup.select('div.cell'):
+                  a_el = row.select_one('span.item_title a, td a.title')
+                  if not a_el: continue
+                  title = a_el.get_text(strip=True)
+                  href = a_el.get('href', '')
+                  link = 'https://www.v2ex.com' + href if href.startswith('/') else href
+                  if title and len(title) > 5:
+                      articles.append({
+                          "title": title, "source": "V2EX",
+                          "url": link,
+                          "summary": "V2EX 开发者社区热帖",
+                          "category": guess_cat(title),
+                          "tags": ["开发者", "社区"],
+                          "date": today
+                      })
+                      n += 1
+                      if n >= 8: break
+              print(f"✅ V2EX: {n} 条")
+          except Exception as e:
+              print(f"❌ V2EX: {e}")
 
-          data = {"updated": today, "articles": articles[:20]}
+          # ── 4. Hacker News (Algolia) ──────────────────
+          try:
+              queries = [
+                  ("side project making money 2026", "副业"),
+                  ("indie hacker revenue month", "副业"),
+                  ("startup profitability 2026", "创业"),
+                  ("AI developer side income", "AI"),
+              ]
+              for q, cat in queries:
+                  url = f"https://hn.algolia.com/api/v1/search?query={q}&tags=story&hitsPerPage=3"
+                  rd = requests.get(url, timeout=8).json()
+                  for h in rd.get('hits', [])[:3]:
+                      title = h.get('title', '')
+                      link = h.get('url', '') or f"https://news.ycombinator.com/item?id={h.get('objectID','')}"
+                      if title:
+                          articles.append({
+                              "title": title, "source": "HackerNews",
+                              "url": link,
+                              "summary": f"HN热门讨论: {q}",
+                              "category": cat,
+                              "tags": ["海外", "独立开发"],
+                              "date": today
+                          })
+              print(f"✅ HackerNews: 12 条")
+          except Exception as e:
+              print(f"❌ HN: {e}")
+
+          # ── 5. Reddit r/Entrepreneur ───────────────────
+          try:
+              url = "https://www.reddit.com/r/Entrepreneur/.json?limit=10"
+              rd = requests.get(url, headers={**headers, "User-Agent": "Mozilla/5.0"}, timeout=8).json()
+              posts = rd.get('data', {}).get('children', [])
+              n = 0
+              for p in posts[:6]:
+                  d = p.get('data', {})
+                  title = d.get('title', '')
+                  link = d.get('url', '')
+                  if title and not d.get('is_self'):
+                      articles.append({
+                          "title": title, "source": "Reddit",
+                          "url": link,
+                          "summary": f"Reddit r/Entrepreneur 讨论",
+                          "category": guess_cat(title),
+                          "tags": ["海外", "创业"],
+                          "date": today
+                      })
+                      n += 1
+              print(f"✅ Reddit: {n} 条")
+          except Exception as e:
+              print(f"❌ Reddit: {e}")
+
+          # ── 6. 百度搜索（补充）────────────────────────
+          try:
+              keywords = [
+                  ("副业 赚钱 2026 真实 方法", "副业"),
+                  ("独立开发者 变现 案例 2026", "副业"),
+                  ("AI 副业 赚钱 最新", "AI"),
+              ]
+              for kw, cat in keywords:
+                  url = f"https://www.baidu.com/s?wd={quote(kw)}&rn=5"
+                  r = requests.get(url, headers=headers, timeout=8)
+                  soup = BeautifulSoup(r.text, 'html.parser')
+                  n = 0
+                  for item in soup.select('.result, .c-container')[:3]:
+                      t_el = item.select_one('h3 a, a.t, .t a')
+                      if not t_el: continue
+                      title = t_el.get_text(strip=True)
+                      link = t_el.get('href', '')
+                      p_el = item.select_one('.c-abstract, .content-right, .Abstract')
+                      desc = p_el.get_text(strip=True)[:150] if p_el else ''
+                      if title and 'baidu.com' not in link:
+                          articles.append({
+                              "title": title, "source": "百度",
+                              "url": link, "summary": desc,
+                              "category": cat,
+                              "tags": kw.split()[:2],
+                              "date": today
+                          })
+                          n += 1
+                  print(f"✅ 百度 {kw[:6]}: {n} 条")
+          except Exception as e:
+              print(f"❌ 百度: {e}")
+
+          # ──────────────────────────────────────────────
+          # 去重
+          # ──────────────────────────────────────────────
+          seen = set()
+          uniq = []
+          for a in articles:
+              key = a['title'][:60]
+              if key not in seen:
+                  seen.add(key)
+                  uniq.append(a)
+          uniq = uniq[:30]
+
+          data = {"updated": today, "articles": uniq}
           with open("articles.json", "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-          print(f"更新了 {len(articles)} 条资讯")
+              json.dump(data, f, ensure_ascii=False, indent=2)
+
+          print(f"\n📦 共 {len(uniq)} 条")
+          for src, cnt in Counter(a['source'] for a in uniq).items():
+              print(f"   {src}: {cnt}条")
           PYEOF
 
       - name: 提交更新
@@ -78,5 +227,5 @@ jobs:
           git config user.name "GitHub Actions"
           git config user.email "actions@github.com"
           git add articles.json
-          git diff --quiet && echo "无变化" || git commit -m "自动更新 $(date +%Y-%m-%d)"
+          git diff --quiet && echo "无变化，跳过" || git commit -m "多源爬虫更新 $(date +%Y-%m-%d)"
           git push
